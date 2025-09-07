@@ -2,6 +2,7 @@ import os
 import requests
 from dotenv import load_dotenv
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 from datetime import datetime
 
 from db import session_scope, NotionPage, Tag, Status
@@ -60,6 +61,9 @@ def sync_notion_pages() -> dict:
     results = fetch_notion_data()
     created = 0
     updated = 0
+    # Prepare local directory for cover images
+    static_dir = Path("static/covers")
+    static_dir.mkdir(parents=True, exist_ok=True)
     with session_scope() as session:
         for item in results:
             page_id = item.get("id")
@@ -94,6 +98,25 @@ def sync_notion_pages() -> dict:
             if cover and cover.get("type") == "file" and cover.get("file"):
                 cover_url = cover["file"].get("url")
                 cover_expiry_time = cover["file"].get("expiry_time")
+            # Try downloading the cover locally (Notion provides time-limited signed URLs)
+            local_cover_path = None
+            if cover_url:
+                try:
+                    resp = requests.get(cover_url, timeout=15)
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("Content-Type", "")
+                    ext = ""
+                    if "image/" in content_type:
+                        ext = "." + content_type.split("/")[-1].split(";")[0]
+                    else:
+                        ext = ".jpg"
+                    filename = f"{page_id}{ext}"
+                    file_path = static_dir / filename
+                    with open(file_path, "wb") as f:
+                        f.write(resp.content)
+                    local_cover_path = f"/static/covers/{filename}"
+                except Exception:
+                    local_cover_path = None
 
             page = session.get(NotionPage, page_id)
             is_new = False
@@ -110,7 +133,7 @@ def sync_notion_pages() -> dict:
             page.last_edited_by_user_id = (item.get("last_edited_by") or {}).get("id")
             page.archived = bool(item.get("archived"))
             page.in_trash = bool(item.get("in_trash"))
-            page.cover_url = cover_url
+            page.cover_url = local_cover_path or cover_url
             page.cover_expiry_time = _iso_to_dt(cover_expiry_time) if cover_expiry_time else None
             page.icon = None  # 간소화
             page.pin = bool((props.get("PIN") or {}).get("checkbox", False))

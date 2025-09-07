@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from typing import List
 from pydantic import BaseModel
 
@@ -7,6 +9,11 @@ from db import init_db, print_database_tables, SessionLocal, NotionPage
 from notion import sync_notion_pages
 
 app = FastAPI()
+
+# Serve static files (e.g., downloaded cover images)
+# Ensure base static directory exists
+Path("static").mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/")

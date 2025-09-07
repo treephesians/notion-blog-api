@@ -1,23 +1,10 @@
-from sqlalchemy import create_engine, Column, String, DateTime
-from sqlalchemy import inspect
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Table, ForeignKey, Boolean, Date, Text
+from sqlalchemy import Column, String, DateTime, Table, ForeignKey, Boolean, Date, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
-from contextlib import contextmanager
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+from app.core.database import Base
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-engine = create_engine(DATABASE_URL)
-
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
 
 class Status(Base):
     __tablename__ = "statuses"
@@ -60,6 +47,7 @@ class NotionPage(Base):
     cover_expiry_time = Column(DateTime(timezone=True))
     icon = Column(Text)
     pin = Column(Boolean, nullable=False, default=False)
+    is_deleted = Column(Boolean, nullable=False, default=False)
     status_id = Column(String, ForeignKey("statuses.id", ondelete="SET NULL"))
     slug = Column(Text)
     title = Column(Text)
@@ -71,39 +59,3 @@ class NotionPage(Base):
     tags = relationship("Tag", secondary=page_tags, backref="pages")
 
 
-class PageRelation(Base):
-    __tablename__ = "page_relations"
-
-    from_page_id = Column(String, ForeignKey("notion_pages.id", ondelete="CASCADE"), primary_key=True)
-    to_page_id = Column(String, ForeignKey("notion_pages.id", ondelete="CASCADE"), primary_key=True)
-
-def init_db():
-    Base.metadata.create_all(bind=engine)
-
-
-def get_database_tables():
-    inspector = inspect(engine)
-    return inspector.get_table_names()
-
-
-def print_database_tables():
-    tables = get_database_tables()
-    print("Database tables:")
-    if tables:
-        for table_name in tables:
-            print(f"- {table_name}")
-    else:
-        print("(no tables found)")
-
-
-@contextmanager
-def session_scope():
-    session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()

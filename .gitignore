@@ -1,3 +1,4 @@
 .env
 .guide
 /static
+__pycache__

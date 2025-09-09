@@ -2,3 +2,4 @@
 .guide
 /static
 __pycache__
+*.pem

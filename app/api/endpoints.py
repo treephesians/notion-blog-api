@@ -16,6 +16,13 @@ async def root():
     print_database_tables()
     return {"message": "Hello World"}
 
+
+@router.post("/notion/sync")
+async def trigger_sync():
+    result = sync_notion_pages()
+    return result
+
+
 @router.get("/notion/posts", response_model=List[PostCard])
 async def get_posts():
     session = SessionLocal()
@@ -35,12 +42,6 @@ async def get_posts():
         return [to_card(p) for p in pages]
     finally:
         session.close()
-
-
-@router.post("/notion/sync")
-async def trigger_sync():
-    result = sync_notion_pages()
-    return result
 
 
 @router.get("/notion/posts/{post_id}", response_model=PostCard)

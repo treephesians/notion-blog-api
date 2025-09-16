@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 import os
 from typing import List
 
@@ -106,6 +106,25 @@ async def get_projects():
         return [to_card(p) for p in pages]
     finally:
         session.close()
+
+
+@router.get("/health/scheduler")
+async def scheduler_health(request: Request):
+    sched = getattr(request.app.state, "scheduler", None)
+    if not sched:
+        return {"running": False}
+    try:
+        jobs = [
+            {
+                "id": j.id,
+                "next_run_time": getattr(j, "next_run_time", None).isoformat() if getattr(j, "next_run_time", None) else None,
+            }
+            for j in sched.get_jobs()
+        ]
+        state = getattr(sched, "state", None)
+        return {"running": state == 1, "state": state, "jobs": jobs}
+    except Exception:
+        return {"running": False}
 
 
 @router.get("/notion/projects/{project_id}", response_model=ProjectDetail)

@@ -7,8 +7,67 @@ from time import perf_counter
 
 from app.api.endpoints import router as api_router
 from app.core.database import Base, engine
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from contextlib import asynccontextmanager
+from app.notion import sync_notion_pages, sync_notion_projects
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure models are imported so that tables are registered
+    import app.models  # noqa: F401
+    Base.metadata.create_all(bind=engine)
+
+    # Start background scheduler for hourly sync
+    scheduler = BackgroundScheduler(timezone="UTC")
+
+    def sync_all():
+        try:
+            print("[scheduler] syncing notion posts...")
+            sync_notion_pages()
+        except Exception as e:
+            print(f"[scheduler] posts sync failed: {e}")
+        try:
+            print("[scheduler] syncing notion projects...")
+            sync_notion_projects()
+        except Exception as e:
+            print(f"[scheduler] projects sync failed: {e}")
+
+    job = scheduler.add_job(
+        sync_all,
+        IntervalTrigger(hours=1),
+        id="hourly_notion_sync",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=600,
+        max_instances=1,
+    )
+    scheduler.start()
+    try:
+        print(f"[scheduler] started. next_run_time={job.next_run_time}")
+    except Exception:
+        pass
+
+    # keep reference for debugging/inspection
+    try:
+        app.state.scheduler = scheduler
+    except Exception:
+        pass
+
+    # Run initial sync once on startup
+    try:
+        print("[startup] running initial notion sync...")
+        sync_all()
+    except Exception as e:
+        print(f"[startup] initial sync failed: {e}")
+
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+app = FastAPI(lifespan=lifespan)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -30,11 +89,4 @@ async def log_process_time(request: Request, call_next):
     return response
 
 app.include_router(api_router)
-
-
-@app.on_event("startup")
-def on_startup():
-    # Ensure models are imported so that tables are registered
-    import app.models  # noqa: F401
-    Base.metadata.create_all(bind=engine)
 

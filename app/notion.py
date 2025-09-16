@@ -13,6 +13,7 @@ load_dotenv()
 NOTION_TOKEN = os.getenv("NOTION_API_KEY")
 POST_DATABASE_ID = os.getenv("NOTION_POST_DATABASE_ID")
 PROJECT_DATABASE_ID = os.getenv("NOTION_PROJECT_DATABASE_ID")
+REQUEST_TIMEOUT = float(os.getenv("NOTION_HTTP_TIMEOUT", "15"))
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -24,7 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 def fetch_notion_data_for_db(database_id: str):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    response = requests.post(url, headers=HEADERS)
+    response = requests.post(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     results = response.json().get("results", [])
     return results

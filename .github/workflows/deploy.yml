@@ -1,0 +1,40 @@
+name: Deploy to EC2 (docker-compose)
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add EC2 host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.EC2_PORT }}" -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT }}
+          script_stop: true
+          script: |
+            set -e
+            cd ${{ secrets.EC2_APP_DIR }}
+            if [ ! -d .git ]; then echo "ERROR: not a git repo at ${{ secrets.EC2_APP_DIR }}" && exit 1; fi
+            # Ensure remote points to the correct repo
+            git remote set-url origin ${{ secrets.GIT_REPO_URL }}
+            git fetch --all --prune
+            git checkout main
+            git pull --ff-only
+            # Ensure .env exists only on server (contains DB/Notion secrets)
+            if [ ! -f .env ]; then echo "ERROR: .env not found on server" && exit 1; fi
+            docker compose pull || true
+            docker compose up -d --build
+            docker image prune -f || true

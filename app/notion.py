@@ -11,7 +11,8 @@ from app.models import NotionPage, Tag, Status
 load_dotenv()
 
 NOTION_TOKEN = os.getenv("NOTION_API_KEY")
-DATABASE_ID = os.getenv("NOTION_POST_DATABASE_ID")
+POST_DATABASE_ID = os.getenv("NOTION_POST_DATABASE_ID")
+PROJECT_DATABASE_ID = os.getenv("NOTION_PROJECT_DATABASE_ID")
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -21,8 +22,8 @@ HEADERS = {
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-def fetch_notion_data():
-    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+def fetch_notion_data_for_db(database_id: str):
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
     response = requests.post(url, headers=HEADERS)
     response.raise_for_status()
     results = response.json().get("results", [])
@@ -75,16 +76,17 @@ def _compute_incoming_ids(results: List[Dict[str, Any]]) -> set:
     return incoming_ids
 
 
-def _mark_missing_pages_deleted(session, incoming_ids: set) -> None:
+def _mark_missing_pages_deleted(session, incoming_ids: set, database_id: str) -> None:
     if not incoming_ids:
         return
-    existing_ids = {p.id for p in session.query(NotionPage.id).all()}
+    existing_ids = {row[0] for row in session.query(NotionPage.id).filter(NotionPage.database_id == database_id).all()}
     missing_ids = existing_ids - incoming_ids
     if not missing_ids:
         return
-    session.query(NotionPage).filter(NotionPage.id.in_(list(missing_ids))).update(
-        {NotionPage.is_deleted: True}, synchronize_session=False
-    )
+    session.query(NotionPage).filter(
+        NotionPage.database_id == database_id,
+        NotionPage.id.in_(list(missing_ids))
+    ).update({NotionPage.is_deleted: True}, synchronize_session=False)
 
 
 def _parse_properties(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,13 +97,33 @@ def _parse_properties(item: Dict[str, Any]) -> Dict[str, Any]:
     title = _get_text_title(props.get("이름") or props.get("Name") or {})
     slug = _get_rich_text(props.get("slug") or {})
 
-    written_date_prop = props.get("작성일") or props.get("Date") or {}
+    written_date_prop = props.get("작성일") or props.get("Date") or props.get("기간") or {}
     written_date = None
     if written_date_prop and written_date_prop.get("date"):
         written_date = written_date_prop["date"].get("start")
 
+    # For project DB, there might be a period with start/end
+    period_start = None
+    period_end = None
+    if (props.get("기간") or {}).get("date"):
+        period_start = (props.get("기간") or {})["date"].get("start")
+        period_end = (props.get("기간") or {})["date"].get("end")
+
     status_prop = _extract_status(props.get("상태") or props.get("Status") or {})
-    tags_prop = _extract_tags(props.get("태그") or props.get("Tags") or {})
+
+    # Merge possible tag sources: 일반 태그/Tags, 기술(multi_select), 종류(select -> as single tag)
+    tags_prop = []
+    for candidate in [props.get("태그"), props.get("Tags"), props.get("기술")]:
+        if candidate:
+            tags_prop.extend(_extract_tags(candidate))
+    # 종류(select)를 태그로 변환해 추가
+    type_select = (props.get("종류") or {}).get("select")
+    if type_select:
+        tags_prop.append({
+            "id": type_select.get("id"),
+            "name": type_select.get("name"),
+            "color": type_select.get("color"),
+        })
 
     cover = item.get("cover") or {}
     cover_url = None
@@ -116,6 +138,8 @@ def _parse_properties(item: Dict[str, Any]) -> Dict[str, Any]:
         "title": title,
         "slug": slug,
         "written_date": written_date,
+        "period_start": period_start,
+        "period_end": period_end,
         "status_prop": status_prop,
         "tags_prop": tags_prop,
         "cover_url": cover_url,
@@ -213,13 +237,55 @@ def _upsert_page_and_relations(
 
 
 def sync_notion_pages() -> dict:
-    results = fetch_notion_data()
+    if not POST_DATABASE_ID:
+        raise RuntimeError("NOTION_POST_DATABASE_ID is not set")
+    results = fetch_notion_data_for_db(POST_DATABASE_ID)
     created = 0
     updated = 0
     static_dir = _ensure_static_covers_dir()
     with session_scope() as session:
         incoming_ids = _compute_incoming_ids(results)
-        _mark_missing_pages_deleted(session, incoming_ids)
+        _mark_missing_pages_deleted(session, incoming_ids, POST_DATABASE_ID)
+
+        for item in results:
+            page_id = item.get("id")
+            existing_page = session.get(NotionPage, page_id)
+            item_last_edited = _iso_to_dt(item.get("last_edited_time"))
+
+            if existing_page and existing_page.last_edited_time and item_last_edited and existing_page.last_edited_time == item_last_edited:
+                continue
+
+            parsed = _parse_properties(item)
+
+            status_id = _upsert_status_if_needed(session, parsed.get("status_prop"))
+            parsed["status_id"] = status_id
+
+            local_cover_path = _download_cover_if_available(parsed.get("cover_url"), static_dir, page_id)
+            is_new = _upsert_page_and_relations(
+                session=session,
+                page_id=page_id,
+                database_id=parsed.get("database_id"),
+                parsed=parsed,
+                local_cover_path=local_cover_path,
+            )
+            if is_new:
+                created += 1
+            else:
+                updated += 1
+
+    return {"created": created, "updated": updated, "total": len(results)}
+
+
+def sync_notion_projects() -> dict:
+    if not PROJECT_DATABASE_ID:
+        raise RuntimeError("NOTION_PROJECT_DATABASE_ID is not set")
+    results = fetch_notion_data_for_db(PROJECT_DATABASE_ID)
+    created = 0
+    updated = 0
+    static_dir = _ensure_static_covers_dir()
+    with session_scope() as session:
+        incoming_ids = _compute_incoming_ids(results)
+        _mark_missing_pages_deleted(session, incoming_ids, PROJECT_DATABASE_ID)
 
         for item in results:
             page_id = item.get("id")

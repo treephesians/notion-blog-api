@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from time import perf_counter
 
 from app.api.endpoints import router as api_router
+from app.core.database import Base, engine
 
 app = FastAPI()
 
@@ -30,4 +31,10 @@ async def log_process_time(request: Request, call_next):
 
 app.include_router(api_router)
 
+
+@app.on_event("startup")
+def on_startup():
+    # Ensure models are imported so that tables are registered
+    import app.models  # noqa: F401
+    Base.metadata.create_all(bind=engine)
 

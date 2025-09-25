@@ -1,11 +1,17 @@
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from datetime import datetime
+import tempfile
+import shutil
+from PIL import Image
 import boto3
 from botocore.client import Config as BotoConfig
-from datetime import datetime
+from boto3.s3.transfer import TransferConfig
 
 from app.core.database import session_scope
 from app.models import NotionPage, Tag, Status
@@ -33,6 +39,15 @@ S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")  # optional for custom endpoints
 S3_PUBLIC_BASE_URL = (os.getenv("S3_PUBLIC_BASE_URL") or "").rstrip("/")  # optional CDN/base url
 
 _s3_client = None
+_http_session = None
+
+# Cover processing configs (env-driven)
+COVER_DOWNLOAD_ENABLED = (os.getenv("COVER_DOWNLOAD_ENABLED", "1") == "1")
+COVER_SOFT_MAX_BYTES = int(os.getenv("COVER_SOFT_MAX_BYTES", str(12 * 1024 * 1024)))  # 12MB
+COVER_HARD_MAX_BYTES = int(os.getenv("COVER_HARD_MAX_BYTES", str(50 * 1024 * 1024)))  # 50MB
+COVER_MAX_DIM = int(os.getenv("COVER_MAX_DIM", "1600"))  # max longer edge pixels
+COVER_QUALITY = int(os.getenv("COVER_QUALITY", "85"))
+DOWNLOAD_CHUNK_SIZE = int(os.getenv("COVER_CHUNK_SIZE", str(256 * 1024)))  # 256KB
 
 def _get_s3_client():
     global _s3_client
@@ -44,6 +59,124 @@ def _get_s3_client():
             config=BotoConfig(s3={"addressing_style": "virtual"}),
         )
     return _s3_client
+
+
+def _get_http_session() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _http_session = session
+    return _http_session
+
+
+def _download_stream_to_temp(url: str) -> Optional[Tuple[str, str, int]]:
+    """Download URL to a temp file by streaming. Returns (path, content_type, total_bytes).
+    Obeys hard size limit to avoid excessive disk usage.
+    """
+    try:
+        with _get_http_session().get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "") or ""
+            # Early reject by hard limit if Content-Length provided
+            clen = r.headers.get("Content-Length")
+            if clen and int(clen) > COVER_HARD_MAX_BYTES:
+                return None
+
+            total = 0
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            try:
+                for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > COVER_HARD_MAX_BYTES:
+                        try:
+                            tmp.close()
+                        finally:
+                            try:
+                                os.unlink(tmp.name)
+                            except Exception:
+                                pass
+                        return None
+                    tmp.write(chunk)
+                tmp.flush()
+                path = tmp.name
+            finally:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+        return path, ctype, total
+    except Exception:
+        return None
+
+
+def _image_dims(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        with Image.open(path) as img:
+            return img.size  # (width, height)
+    except Exception:
+        return None
+
+
+def _process_image_to_limit(src_path: str, soft_limit: int, max_dim: int, quality: int,
+                            preferred_format: Optional[str] = None) -> Optional[Tuple[str, str, str]]:
+    """Downscale and re-encode image if needed to satisfy size and dimension constraints.
+    Returns (processed_path, content_type, ext)
+    - If the original already satisfies constraints, returns original path without re-encode.
+    - Uses JPEG by default for re-encoding to reduce size; keeps PNG/WebP when small enough.
+    """
+    try:
+        orig_size = os.path.getsize(src_path)
+        dims = _image_dims(src_path)
+
+        # Decide pass-through
+        if (orig_size <= soft_limit) and dims and max(dims) <= max_dim:
+            # Keep original file and content type best-effort
+            # Detect ext/content-type by Pillow
+            with Image.open(src_path) as img:
+                fmt = (img.format or "JPEG").upper()
+            if fmt == "PNG":
+                ctype = "image/png"
+                ext = ".png"
+            elif fmt == "WEBP":
+                ctype = "image/webp"
+                ext = ".webp"
+            else:
+                ctype = "image/jpeg"
+                ext = ".jpg"
+            return src_path, ctype, ext
+
+        # Need processing: open and re-encode with max_dim + quality
+        with Image.open(src_path) as img:
+            # Convert to RGB for JPEG if needed
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            # Preserve aspect ratio, bound by max_dim
+            img.thumbnail((max_dim, max_dim))
+
+            out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            out_path = out_tmp.name
+            try:
+                out_tmp.close()
+            except Exception:
+                pass
+
+            img.save(out_path, format=preferred_format or "JPEG", quality=quality, optimize=True)
+            ctype = "image/jpeg" if (preferred_format or "JPEG").upper() == "JPEG" else f"image/{(preferred_format or 'jpeg').lower()}"
+            ext = ".jpg"
+            return out_path, ctype, ext
+    except Exception:
+        return None
 
 def fetch_notion_data_for_db(database_id: str):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
@@ -192,38 +325,101 @@ def _upsert_status_if_needed(session, status_prop: Optional[Dict[str, Any]]) -> 
 
 
 def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, page_id: str) -> Optional[str]:
-    if not cover_url:
+    if not cover_url or not COVER_DOWNLOAD_ENABLED:
         return None
     try:
-        resp = requests.get(cover_url, timeout=15)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        ext = ""
-        if "image/" in content_type:
-            ext = "." + content_type.split("/")[-1].split(";")[0]
-        else:
-            ext = ".jpg"
+        # 1) Stream download to temp
+        dl = _download_stream_to_temp(cover_url)
+        if not dl:
+            return None
+        tmp_path, content_type, total_bytes = dl
+
+        # Ensure it's an image; if not clearly image, try opening via PIL as a final check
+        if not (content_type.startswith("image/") if content_type else False):
+            try:
+                with Image.open(tmp_path):
+                    pass
+                # If Pillow can open, treat as jpeg by default
+                content_type = "image/jpeg"
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                return None
+
+        # 2) Downscale/re-encode if needed to meet soft constraints
+        proc = _process_image_to_limit(
+            tmp_path,
+            soft_limit=COVER_SOFT_MAX_BYTES,
+            max_dim=COVER_MAX_DIM,
+            quality=COVER_QUALITY,
+            preferred_format="JPEG",
+        )
+        if not proc:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return None
+        processed_path, processed_ctype, ext = proc
+
+        # 3) Save: S3 or local files, then cleanup
         filename = f"{page_id}{ext}"
-        # If S3 bucket configured, upload instead of local save
         if S3_BUCKET:
             key = "/".join([p for p in [S3_PREFIX, filename] if p])
             s3 = _get_s3_client()
-            s3.put_object(
-                Bucket=S3_BUCKET,
-                Key=key,
-                Body=resp.content,
-                ContentType=content_type or "image/jpeg",
-                CacheControl="public, max-age=31536000",
-                ACL="public-read",
-            )
+
+            try:
+                # Use upload_file with controlled concurrency to reduce memory
+                cfg = TransferConfig(
+                    multipart_threshold=5 * 1024 * 1024,
+                    multipart_chunksize=5 * 1024 * 1024,
+                    max_concurrency=2,
+                    use_threads=True,
+                )
+                s3.upload_file(
+                    Filename=processed_path,
+                    Bucket=S3_BUCKET,
+                    Key=key,
+                    ExtraArgs={
+                        "ContentType": processed_ctype or "image/jpeg",
+                        "CacheControl": "public, max-age=31536000",
+                        "ACL": "public-read",
+                    },
+                    Config=cfg,
+                )
+            finally:
+                try:
+                    os.unlink(processed_path)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+
             if S3_PUBLIC_BASE_URL:
                 return f"{S3_PUBLIC_BASE_URL}/{key}"
-            # default public URL for AWS S3
             return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
         else:
-            file_path = static_dir / filename
-            with open(file_path, "wb") as f:
-                f.write(resp.content)
+            dest_path = static_dir / filename
+            # Ensure dir exists
+            static_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(processed_path, "rb") as src, open(dest_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=DOWNLOAD_CHUNK_SIZE)
+            finally:
+                try:
+                    os.unlink(processed_path)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
             return f"/static/covers/{filename}"
     except Exception:
         return None

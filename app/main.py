@@ -5,6 +5,7 @@ from typing import List
 from pydantic import BaseModel
 from time import perf_counter
 
+import os
 from app.api.endpoints import router as api_router
 from app.core.database import Base, engine
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,8 +19,11 @@ async def lifespan(app: FastAPI):
     import app.models  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
-    # Start background scheduler for hourly sync
-    scheduler = BackgroundScheduler(timezone="UTC")
+    enable_scheduler = os.getenv("ENABLE_SCHEDULER", "1") == "1"
+    scheduler = None
+    if enable_scheduler:
+        # Start background scheduler for hourly sync
+        scheduler = BackgroundScheduler(timezone="UTC")
 
     def sync_all():
         try:
@@ -33,20 +37,21 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"[scheduler] projects sync failed: {e}")
 
-    job = scheduler.add_job(
-        sync_all,
-        IntervalTrigger(hours=1),
-        id="hourly_notion_sync",
-        replace_existing=True,
-        coalesce=True,
-        misfire_grace_time=600,
-        max_instances=1,
-    )
-    scheduler.start()
-    try:
-        print(f"[scheduler] started. next_run_time={job.next_run_time}")
-    except Exception:
-        pass
+    if scheduler:
+        job = scheduler.add_job(
+            sync_all,
+            IntervalTrigger(hours=1),
+            id="hourly_notion_sync",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=600,
+            max_instances=1,
+        )
+        scheduler.start()
+        try:
+            print(f"[scheduler] started. next_run_time={job.next_run_time}")
+        except Exception:
+            pass
 
     # keep reference for debugging/inspection
     try:
@@ -54,17 +59,19 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    # Run initial sync once on startup
-    try:
-        print("[startup] running initial notion sync...")
-        sync_all()
-    except Exception as e:
-        print(f"[startup] initial sync failed: {e}")
+    # Optionally run initial sync once on startup (only when scheduler enabled)
+    if scheduler:
+        try:
+            print("[startup] running initial notion sync...")
+            sync_all()
+        except Exception as e:
+            print(f"[startup] initial sync failed: {e}")
 
     try:
         yield
     finally:
-        scheduler.shutdown(wait=False)
+        if scheduler:
+            scheduler.shutdown(wait=False)
 
 
 app = FastAPI(lifespan=lifespan)

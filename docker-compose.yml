@@ -1,6 +1,7 @@
 services:
   web:
     build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: ${DATABASE_URL}
       NOTION_API_KEY: ${NOTION_API_KEY}
@@ -12,7 +13,27 @@ services:
       AWS_REGION: ${AWS_REGION}
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
       S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL}
+      ENABLE_SCHEDULER: "0"
     ports:
       - "8000:8000"
     volumes:
       - ./static:/app/static
+    restart: always
+
+  sync:
+    build: .
+    command: python -m app.worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      NOTION_API_KEY: ${NOTION_API_KEY}
+      NOTION_POST_DATABASE_ID: ${NOTION_POST_DATABASE_ID}
+      NOTION_PROJECT_DATABASE_ID: ${NOTION_PROJECT_DATABASE_ID}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX}
+      AWS_REGION: ${AWS_REGION}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL}
+      ENABLE_SCHEDULER: "1"
+    volumes:
+      - ./static:/app/static
+    restart: always

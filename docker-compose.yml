@@ -6,6 +6,12 @@ services:
       NOTION_API_KEY: ${NOTION_API_KEY}
       NOTION_POST_DATABASE_ID: ${NOTION_POST_DATABASE_ID}
       NOTION_PROJECT_DATABASE_ID: ${NOTION_PROJECT_DATABASE_ID}
+      # S3 (optional, for cover uploads). Set these in EC2 .env
+      S3_BUCKET: ${S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX}
+      AWS_REGION: ${AWS_REGION}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL}
     ports:
       - "8000:8000"
     volumes:

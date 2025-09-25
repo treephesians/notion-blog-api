@@ -3,6 +3,8 @@ import requests
 from dotenv import load_dotenv
 from typing import Any, Dict, List, Optional
 from pathlib import Path
+import boto3
+from botocore.client import Config as BotoConfig
 from datetime import datetime
 
 from app.core.database import session_scope
@@ -22,6 +24,26 @@ HEADERS = {
 }
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# S3 configuration
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_PREFIX = (os.getenv("S3_PREFIX") or "").strip("/")  # e.g., cover-image
+S3_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-northeast-2"
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")  # optional for custom endpoints
+S3_PUBLIC_BASE_URL = (os.getenv("S3_PUBLIC_BASE_URL") or "").rstrip("/")  # optional CDN/base url
+
+_s3_client = None
+
+def _get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client(
+            "s3",
+            region_name=S3_REGION,
+            endpoint_url=S3_ENDPOINT_URL,
+            config=BotoConfig(s3={"addressing_style": "virtual"}),
+        )
+    return _s3_client
 
 def fetch_notion_data_for_db(database_id: str):
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
@@ -182,10 +204,27 @@ def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, pag
         else:
             ext = ".jpg"
         filename = f"{page_id}{ext}"
-        file_path = static_dir / filename
-        with open(file_path, "wb") as f:
-            f.write(resp.content)
-        return f"/static/covers/{filename}"
+        # If S3 bucket configured, upload instead of local save
+        if S3_BUCKET:
+            key = "/".join([p for p in [S3_PREFIX, filename] if p])
+            s3 = _get_s3_client()
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=key,
+                Body=resp.content,
+                ContentType=content_type or "image/jpeg",
+                CacheControl="public, max-age=31536000",
+                ACL="public-read",
+            )
+            if S3_PUBLIC_BASE_URL:
+                return f"{S3_PUBLIC_BASE_URL}/{key}"
+            # default public URL for AWS S3
+            return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+        else:
+            file_path = static_dir / filename
+            with open(file_path, "wb") as f:
+                f.write(resp.content)
+            return f"/static/covers/{filename}"
     except Exception:
         return None
 

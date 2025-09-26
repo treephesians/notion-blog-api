@@ -627,6 +627,7 @@ def sync_notion_pages() -> dict:
     return {"created": created, "updated": updated, "total": len(results)}
 
 
+
 def sync_notion_projects() -> dict:
     if not PROJECT_DATABASE_ID:
         raise RuntimeError("NOTION_PROJECT_DATABASE_ID is not set")

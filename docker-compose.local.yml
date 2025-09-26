@@ -31,6 +31,19 @@ services:
     volumes:
       - ./static:/app/static
 
+  proxy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - web
+
   sync:
     build: .
     depends_on:

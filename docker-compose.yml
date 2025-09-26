@@ -20,20 +20,6 @@ services:
       - ./static:/app/static
     restart: always
 
-  proxy:
-    image: caddy:2
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      DOMAIN: ${DOMAIN}
-      ACME_EMAIL: ${ACME_EMAIL}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    depends_on:
-      - web
-    restart: always
-
   sync:
     build: .
     command: python -m app.worker

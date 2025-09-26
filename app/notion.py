@@ -39,6 +39,10 @@ S3_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-no
 S3_ENDPOINT_URL = (os.getenv("S3_ENDPOINT_URL") or None)  # optional for custom endpoints; treat empty as None
 S3_PUBLIC_BASE_URL = (os.getenv("S3_PUBLIC_BASE_URL") or "").rstrip("/")  # optional CDN/base url
 
+# Revalidation webhook
+REVALIDATE_URL = os.getenv("REVALIDATE_URL", "https://jblog.my/api/revalidate")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+
 _s3_client = None
 _http_session = None
 
@@ -51,6 +55,33 @@ COVER_QUALITY = int(os.getenv("COVER_QUALITY", "85"))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv("COVER_CHUNK_SIZE", str(256 * 1024)))  # 256KB
 # Debug logging toggles (현재는 분기와 무관하게 주요 단계는 모두 출력)
 LOG_COVER_DEBUG = (os.getenv("LOG_COVER_DEBUG", "0") == "1")
+
+
+def _post_revalidate(tag: str) -> None:
+    """Fire-and-forget revalidation webhook. Never raise; just log."""
+    url = (REVALIDATE_URL or "").strip()
+    secret = (WEBHOOK_SECRET or "").strip()
+    if not url or not secret:
+        print(f"[revalidate] skip (missing url/secret) url={url!r} secret_present={bool(secret)} tag={tag}")
+        return
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "x-webhook-secret": secret,
+                "Content-Type": "application/json",
+            },
+            json={"tag": tag},
+            timeout=5,
+        )
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[revalidate] failed status={resp.status_code} body={resp.text[:200]} exc={e}")
+            return
+        print(f"[revalidate] success tag={tag} status={resp.status_code}")
+    except Exception as e:
+        print(f"[revalidate] error tag={tag} exc={e}")
 
 def _get_s3_client():
     global _s3_client
@@ -586,6 +617,13 @@ def sync_notion_pages() -> dict:
             else:
                 updated += 1
 
+    # trigger revalidation if any change
+    try:
+        if created or updated:
+            _post_revalidate("posts")
+    except Exception:
+        pass
+
     return {"created": created, "updated": updated, "total": len(results)}
 
 
@@ -626,6 +664,12 @@ def sync_notion_projects() -> dict:
             else:
                 updated += 1
 
+    # trigger revalidation (projects로 구분 필요 시 태그 변경 가능)
+    try:
+        if created or updated:
+            _post_revalidate("posts")
+    except Exception:
+        pass
     return {"created": created, "updated": updated, "total": len(results)}
 
 

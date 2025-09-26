@@ -25,8 +25,28 @@ services:
       AWS_REGION: ${AWS_REGION}
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
       S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL}
+      ENABLE_SCHEDULER: "0"
     ports:
       - "8000:8000"
+    volumes:
+      - ./static:/app/static
+
+  sync:
+    build: .
+    depends_on:
+      - db
+    command: python -m app.worker
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      NOTION_API_KEY: ${NOTION_API_KEY}
+      NOTION_POST_DATABASE_ID: ${NOTION_POST_DATABASE_ID}
+      NOTION_PROJECT_DATABASE_ID: ${NOTION_PROJECT_DATABASE_ID}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX}
+      AWS_REGION: ${AWS_REGION}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL}
+      ENABLE_SCHEDULER: "1"
     volumes:
       - ./static:/app/static
 

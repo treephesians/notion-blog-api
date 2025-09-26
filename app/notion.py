@@ -11,6 +11,7 @@ import shutil
 from PIL import Image
 import boto3
 from botocore.client import Config as BotoConfig
+from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
 
 from app.core.database import session_scope
@@ -35,7 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_PREFIX = (os.getenv("S3_PREFIX") or "").strip("/")  # e.g., cover-image
 S3_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-northeast-2"
-S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")  # optional for custom endpoints
+S3_ENDPOINT_URL = (os.getenv("S3_ENDPOINT_URL") or None)  # optional for custom endpoints; treat empty as None
 S3_PUBLIC_BASE_URL = (os.getenv("S3_PUBLIC_BASE_URL") or "").rstrip("/")  # optional CDN/base url
 
 _s3_client = None
@@ -48,6 +49,8 @@ COVER_HARD_MAX_BYTES = int(os.getenv("COVER_HARD_MAX_BYTES", str(50 * 1024 * 102
 COVER_MAX_DIM = int(os.getenv("COVER_MAX_DIM", "1600"))  # max longer edge pixels
 COVER_QUALITY = int(os.getenv("COVER_QUALITY", "85"))
 DOWNLOAD_CHUNK_SIZE = int(os.getenv("COVER_CHUNK_SIZE", str(256 * 1024)))  # 256KB
+# Debug logging toggles (현재는 분기와 무관하게 주요 단계는 모두 출력)
+LOG_COVER_DEBUG = (os.getenv("LOG_COVER_DEBUG", "0") == "1")
 
 def _get_s3_client():
     global _s3_client
@@ -83,12 +86,14 @@ def _download_stream_to_temp(url: str) -> Optional[Tuple[str, str, int]]:
     Obeys hard size limit to avoid excessive disk usage.
     """
     try:
+        print(f"[cover][trace] stream_download start url={url[:120]}")
         with _get_http_session().get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
             r.raise_for_status()
             ctype = r.headers.get("Content-Type", "") or ""
             # Early reject by hard limit if Content-Length provided
             clen = r.headers.get("Content-Length")
             if clen and int(clen) > COVER_HARD_MAX_BYTES:
+                print(f"[cover][trace] stream_download reject by Content-Length={clen} > HARD={COVER_HARD_MAX_BYTES}")
                 return None
 
             total = 0
@@ -99,6 +104,7 @@ def _download_stream_to_temp(url: str) -> Optional[Tuple[str, str, int]]:
                         continue
                     total += len(chunk)
                     if total > COVER_HARD_MAX_BYTES:
+                        print(f"[cover][trace] stream_download abort: total={total} > HARD={COVER_HARD_MAX_BYTES}")
                         try:
                             tmp.close()
                         finally:
@@ -115,8 +121,10 @@ def _download_stream_to_temp(url: str) -> Optional[Tuple[str, str, int]]:
                     tmp.close()
                 except Exception:
                     pass
+        print(f"[cover][trace] stream_download done bytes={total} ctype={ctype}")
         return path, ctype, total
-    except Exception:
+    except Exception as e:
+        print(f"[cover][trace] stream_download error exc={e}")
         return None
 
 
@@ -141,6 +149,7 @@ def _process_image_to_limit(src_path: str, soft_limit: int, max_dim: int, qualit
 
         # Decide pass-through
         if (orig_size <= soft_limit) and dims and max(dims) <= max_dim:
+            print(f"[cover][trace] process passthrough size={orig_size} dims={dims}")
             # Keep original file and content type best-effort
             # Detect ext/content-type by Pillow
             with Image.open(src_path) as img:
@@ -174,8 +183,14 @@ def _process_image_to_limit(src_path: str, soft_limit: int, max_dim: int, qualit
             img.save(out_path, format=preferred_format or "JPEG", quality=quality, optimize=True)
             ctype = "image/jpeg" if (preferred_format or "JPEG").upper() == "JPEG" else f"image/{(preferred_format or 'jpeg').lower()}"
             ext = ".jpg"
+            try:
+                psize = os.path.getsize(out_path)
+            except Exception:
+                psize = None
+            print(f"[cover][trace] process reencode -> size={psize} max_dim={max_dim} quality={quality}")
             return out_path, ctype, ext
-    except Exception:
+    except Exception as e:
+        print(f"[cover][trace] process error exc={e}")
         return None
 
 def fetch_notion_data_for_db(database_id: str):
@@ -325,14 +340,21 @@ def _upsert_status_if_needed(session, status_prop: Optional[Dict[str, Any]]) -> 
 
 
 def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, page_id: str) -> Optional[str]:
-    if not cover_url or not COVER_DOWNLOAD_ENABLED:
+    if not cover_url:
+        print(f"[cover][trace] skip(no_url) page_id={page_id}")
+        return None
+    if not COVER_DOWNLOAD_ENABLED:
+        print(f"[cover][trace] skip(disabled) page_id={page_id}")
         return None
     try:
         # 1) Stream download to temp
+        print(f"[cover][trace] downloading page_id={page_id}")
         dl = _download_stream_to_temp(cover_url)
         if not dl:
+            print(f"[cover][trace] download_failed_or_hardlimit page_id={page_id}")
             return None
         tmp_path, content_type, total_bytes = dl
+        print(f"[cover][trace] downloaded bytes={total_bytes} ctype={content_type} page_id={page_id}")
 
         # Ensure it's an image; if not clearly image, try opening via PIL as a final check
         if not (content_type.startswith("image/") if content_type else False):
@@ -342,6 +364,7 @@ def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, pag
                 # If Pillow can open, treat as jpeg by default
                 content_type = "image/jpeg"
             except Exception:
+                print(f"[cover][trace] not_image page_id={page_id}")
                 try:
                     os.unlink(tmp_path)
                 except Exception:
@@ -357,16 +380,24 @@ def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, pag
             preferred_format="JPEG",
         )
         if not proc:
+            print(f"[cover][trace] process_failed page_id={page_id}")
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
             return None
         processed_path, processed_ctype, ext = proc
+        try:
+            psize = os.path.getsize(processed_path)
+        except Exception:
+            psize = None
+        print(f"[cover][trace] processed size={psize} ext={ext} ctype={processed_ctype} page_id={page_id}")
 
         # 3) Save: S3 or local files, then cleanup
         filename = f"{page_id}{ext}"
+        print(S3_BUCKET)
         if S3_BUCKET:
+            print(f"[cover][trace] s3_branch bucket={S3_BUCKET} prefix={S3_PREFIX} page_id={page_id}")
             key = "/".join([p for p in [S3_PREFIX, filename] if p])
             s3 = _get_s3_client()
 
@@ -389,6 +420,46 @@ def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, pag
                     },
                     Config=cfg,
                 )
+                # success log
+                try:
+                    fsize = os.path.getsize(processed_path)
+                except Exception:
+                    fsize = None
+                print(f"[cover][s3-upload] success bucket={S3_BUCKET} key={key} size={fsize} content_type={processed_ctype}")
+            except ClientError as ce:
+                try:
+                    err_code = (ce.response or {}).get("Error", {}).get("Code")
+                    err_msg = (ce.response or {}).get("Error", {}).get("Message")
+                except Exception:
+                    err_code = None
+                    err_msg = None
+                print(f"[cover][s3-upload] client error bucket={S3_BUCKET} key={key} code={err_code} msg={err_msg} exc={ce}")
+                # Fallback to local save
+                try:
+                    dest_path = static_dir / filename
+                    static_dir.mkdir(parents=True, exist_ok=True)
+                    with open(processed_path, "rb") as src, open(dest_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=DOWNLOAD_CHUNK_SIZE)
+                    ret = f"/static/covers/{filename}"
+                    print(f"[cover][trace] fallback_local(client_error) url={ret}")
+                    return ret
+                except Exception as fe:
+                    print(f"[cover][trace] fallback_local_failed exc={fe}")
+                    raise
+            except Exception as e:
+                print(f"[cover][s3-upload] failed bucket={S3_BUCKET} key={key} exc={e}")
+                # Fallback to local save
+                try:
+                    dest_path = static_dir / filename
+                    static_dir.mkdir(parents=True, exist_ok=True)
+                    with open(processed_path, "rb") as src, open(dest_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=DOWNLOAD_CHUNK_SIZE)
+                    ret = f"/static/covers/{filename}"
+                    print(f"[cover][trace] fallback_local(upload_failed) url={ret}")
+                    return ret
+                except Exception as fe:
+                    print(f"[cover][trace] fallback_local_failed exc={fe}")
+                    raise
             finally:
                 try:
                     os.unlink(processed_path)
@@ -401,9 +472,12 @@ def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, pag
                     pass
 
             if S3_PUBLIC_BASE_URL:
+                print(f"[cover][trace] return_url cdn={S3_PUBLIC_BASE_URL}/{key}")
                 return f"{S3_PUBLIC_BASE_URL}/{key}"
+            print(f"[cover][trace] return_url s3=https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}")
             return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
         else:
+            print(f"[cover][trace] local_branch page_id={page_id} filename={filename}")
             dest_path = static_dir / filename
             # Ensure dir exists
             static_dir.mkdir(parents=True, exist_ok=True)
@@ -420,8 +494,11 @@ def _download_cover_if_available(cover_url: Optional[str], static_dir: Path, pag
                         os.unlink(tmp_path)
                 except Exception:
                     pass
-            return f"/static/covers/{filename}"
-    except Exception:
+            ret = f"/static/covers/{filename}"
+            print(f"[cover][trace] return_url local={ret}")
+            return ret
+    except Exception as e:
+        print(f"[cover][trace] error page_id={page_id} exc={e}")
         return None
 
 
